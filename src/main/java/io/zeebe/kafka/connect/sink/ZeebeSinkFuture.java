@@ -22,8 +22,9 @@ import io.grpc.Status.Code;
 import io.grpc.StatusRuntimeException;
 import java.util.EnumSet;
 import java.util.Set;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
@@ -55,15 +56,18 @@ class ZeebeSinkFuture extends CompletableFuture<PublishMessageResponse> {
 
   private final FinalCommandStep<PublishMessageResponse> command;
 
-  // TODO inject reusable executor
-  private final ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+  // shared by all futures of a single task, owned and closed by ZeebeSinkTask
+  private final ScheduledExecutorService retryExecutor;
   private BackoffSupplier backoffSupplier;
   private long currentRetryDelay = 50L;
 
   ZeebeSinkFuture(
-      final FinalCommandStep<PublishMessageResponse> command, BackoffSupplier backoffSupplier) {
+      final FinalCommandStep<PublishMessageResponse> command,
+      BackoffSupplier backoffSupplier,
+      final ScheduledExecutorService retryExecutor) {
     this.command = command;
     this.backoffSupplier = backoffSupplier;
+    this.retryExecutor = retryExecutor;
   }
 
   @SuppressWarnings("unchecked")
@@ -93,7 +97,7 @@ class ZeebeSinkFuture extends CompletableFuture<PublishMessageResponse> {
                           + ", backoff/delay: "
                           + currentRetryDelay
                           + " ms");
-                  executor.schedule(this::executeAsync, currentRetryDelay, TimeUnit.MILLISECONDS);
+                  scheduleRetry();
                 } else if (FAILURE_CODES.contains(code)) {
                   completeExceptionally(throwable);
                 } else {
@@ -106,5 +110,16 @@ class ZeebeSinkFuture extends CompletableFuture<PublishMessageResponse> {
             });
 
     return this;
+  }
+
+  private void scheduleRetry() {
+    try {
+      retryExecutor.schedule(this::executeAsync, currentRetryDelay, TimeUnit.MILLISECONDS);
+    } catch (final RejectedExecutionException e) {
+      // the task is stopping, so the retry will never run; cancel instead of leaving the caller
+      // blocked forever on join()
+      LOGGER.debug("Failed to schedule retry of {}, the task is most likely stopping", command, e);
+      completeExceptionally(new CancellationException("Retry rejected, task is stopping"));
+    }
   }
 }
