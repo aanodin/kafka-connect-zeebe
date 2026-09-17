@@ -32,6 +32,11 @@ import java.util.Collection;
 import java.util.Map;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.sink.SinkRecord;
 import org.apache.kafka.connect.sink.SinkTask;
@@ -44,6 +49,7 @@ public class ZeebeSinkTask extends SinkTask {
   private ManagedClient managedClient;
   private JsonRecordParser parser;
   private BackoffSupplier backoffSupplier;
+  private ScheduledExecutorService retryExecutor;
 
   @Override
   public void start(final Map<String, String> props) {
@@ -57,6 +63,9 @@ public class ZeebeSinkTask extends SinkTask {
             .backoffFactor(1.5)
             .jitterFactor(0.2)
             .build();
+    // a single executor shared by all futures of this task; one per SinkRecord would leak a thread
+    // per retried record, as the futures are never shut down
+    retryExecutor = Executors.newSingleThreadScheduledExecutor(new RetryThreadFactory());
   }
 
   // The documentation specifies that we probably shouldn't block here but I'm not sure what the
@@ -68,6 +77,13 @@ public class ZeebeSinkTask extends SinkTask {
       LOGGER.trace("Published {} messages", sinkRecords.size());
     } catch (final CancellationException e) {
       LOGGER.debug("Publish requests cancelled, probably due to task stopping", e);
+    } catch (final CompletionException e) {
+      // allOf() wraps the cancellation of a single request, e.g. a retry rejected on shutdown
+      if (e.getCause() instanceof CancellationException) {
+        LOGGER.debug("Publish requests cancelled, probably due to task stopping", e);
+      } else {
+        throw new ConnectException(e);
+      }
     } catch (final AlreadyClosedException e) {
       LOGGER.debug(
           "Expected to publish {} messages, but the client is already closed", sinkRecords.size());
@@ -79,6 +95,10 @@ public class ZeebeSinkTask extends SinkTask {
   @Override
   public void stop() {
     managedClient.close();
+
+    if (retryExecutor != null) {
+      retryExecutor.shutdownNow();
+    }
   }
 
   @Override
@@ -91,7 +111,7 @@ public class ZeebeSinkTask extends SinkTask {
     final CompletableFuture[] inFlightRequests =
         sinkRecords.stream()
             .map(r -> this.preparePublishRequest(client, r))
-            .map(command -> new ZeebeSinkFuture(command, backoffSupplier))
+            .map(command -> new ZeebeSinkFuture(command, backoffSupplier, retryExecutor))
             .map(ZeebeSinkFuture::executeAsync)
             .toArray(CompletableFuture[]::new);
 
@@ -138,5 +158,16 @@ public class ZeebeSinkTask extends SinkTask {
     }
 
     return builder.build();
+  }
+
+  private static final class RetryThreadFactory implements ThreadFactory {
+    private static final AtomicInteger THREAD_COUNT = new AtomicInteger();
+
+    @Override
+    public Thread newThread(final Runnable r) {
+      final Thread thread = new Thread(r, "zeebe-sink-retry-" + THREAD_COUNT.incrementAndGet());
+      thread.setDaemon(true);
+      return thread;
+    }
   }
 }

@@ -26,14 +26,31 @@ import io.grpc.Status;
 import io.grpc.Status.Code;
 import io.grpc.StatusRuntimeException;
 import java.time.Duration;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
 
 @Execution(ExecutionMode.CONCURRENT)
 class ZeebeSinkFutureTest {
+
+  private static ScheduledExecutorService retryExecutor;
+
+  @BeforeAll
+  static void startExecutor() {
+    retryExecutor = Executors.newSingleThreadScheduledExecutor();
+  }
+
+  @AfterAll
+  static void stopExecutor() {
+    retryExecutor.shutdownNow();
+  }
 
   @Test
   void shouldCompleteByDefault() {
@@ -102,6 +119,26 @@ class ZeebeSinkFutureTest {
             });
   }
 
+  @Test
+  void shouldCompleteExceptionalIfRetryIsRejected() {
+    // given
+    final ScheduledExecutorService stoppedExecutor = Executors.newSingleThreadScheduledExecutor();
+    stoppedExecutor.shutdownNow();
+    final ZeebeSinkFuture future =
+        new ZeebeSinkFuture(
+            new FinalStepMock(
+                () -> {
+                  throw new StatusRuntimeException(Status.fromCode(Code.UNAVAILABLE));
+                }),
+            new ExponentialBackoffBuilderImpl().build(),
+            stoppedExecutor);
+
+    // when
+    assertThatThrownBy(() -> future.executeAsync().join())
+        // then
+        .isInstanceOf(CancellationException.class);
+  }
+
   private Runnable retriable(final Code code) {
     return new Runnable() {
       boolean failed = false;
@@ -128,7 +165,8 @@ class ZeebeSinkFutureTest {
   }
 
   private ZeebeSinkFuture create(final Runnable r) {
-    return new ZeebeSinkFuture(new FinalStepMock(r), new ExponentialBackoffBuilderImpl().build());
+    return new ZeebeSinkFuture(
+        new FinalStepMock(r), new ExponentialBackoffBuilderImpl().build(), retryExecutor);
   }
 
   static class FinalStepMock implements FinalCommandStep<PublishMessageResponse> {
